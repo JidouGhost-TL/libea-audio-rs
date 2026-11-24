@@ -1,10 +1,28 @@
 //! Streaming zero-allocation decoder over an [`EaStreamView`].
 
-use crate::codec::{decode_ea_xa_subframe_at, decode_spu_block, AdpcmState, Codec};
-use crate::{ChunkKind, EaStreamView, Error, Result, SCDL_HEADER_LEN};
+use crate::codec::{
+    decode_ea_xa_subframe_strided, decode_ea_xa_v1_stereo_block, decode_spu_block,
+    decode_spu_block_strided, AdpcmState, Codec,
+};
+use crate::{ChunkKind, EaStreamView, Error, Result};
 
 const GROUP_FRAMES: usize = 28;
 const MAX_CHANNELS: usize = 2;
+const INV_32768: f32 = 1.0 / 32768.0;
+
+#[derive(Debug, Clone, Copy)]
+struct LoopSnapshot<'a> {
+    next_chunk_offset: usize,
+    payload: &'a [u8],
+    payload_pos: usize,
+    payload_big_endian: bool,
+    in_payload_header: bool,
+    group: [i16; GROUP_FRAMES * MAX_CHANNELS],
+    group_frames: usize,
+    group_pos: usize,
+    state: [AdpcmState; MAX_CHANNELS],
+    frames_decoded: u64,
+}
 
 /// Streaming decoder. State is fixed-size; no heap allocation occurs.
 #[derive(Debug, Clone)]
@@ -14,23 +32,27 @@ pub struct EaDecoder<'a> {
     next_chunk_offset: usize,
     started: bool,
     finished: bool,
-    // Current SCDl payload cursor.
+    // Current SCDl/SCDb payload cursor.
     payload: &'a [u8],
     payload_pos: usize,
+    payload_big_endian: bool,
     in_payload_header: bool,
     // Decoded group buffer (interleaved).
     group: [i16; GROUP_FRAMES * MAX_CHANNELS],
     group_frames: usize,
     group_pos: usize,
     state: [AdpcmState; MAX_CHANNELS],
-    /// Total frames emitted since start/reset (excluding loop repeats wrap).
+    /// Total frames emitted since start/reset (reset to loop_start on wrap).
     frames_decoded: u64,
     loop_count: u32,
+    loop_snapshot: Option<LoopSnapshot<'a>>,
 }
 
 impl<'a> EaDecoder<'a> {
     /// Create a decoder for a parsed stream view.
+    #[must_use]
     pub fn new(view: EaStreamView<'a>) -> Self {
+        let be = view.is_big_endian();
         Self {
             view,
             next_chunk_offset: 0,
@@ -38,6 +60,7 @@ impl<'a> EaDecoder<'a> {
             finished: false,
             payload: &[],
             payload_pos: 0,
+            payload_big_endian: be,
             in_payload_header: true,
             group: [0; GROUP_FRAMES * MAX_CHANNELS],
             group_frames: 0,
@@ -45,52 +68,61 @@ impl<'a> EaDecoder<'a> {
             state: [AdpcmState::default(); MAX_CHANNELS],
             frames_decoded: 0,
             loop_count: 0,
+            loop_snapshot: None,
         }
     }
 
     /// Channel count (1 or 2).
+    #[must_use]
     pub fn channels(&self) -> u32 {
         self.view.header().channels
     }
 
     /// Sample rate in Hz.
+    #[must_use]
     pub fn sample_rate(&self) -> u32 {
         self.view.header().sample_rate
     }
 
     /// Resolved codec.
+    #[must_use]
     pub fn codec(&self) -> Codec {
         self.view.header().codec
     }
 
     /// Frames decoded so far.
+    #[must_use]
     pub fn frames_decoded(&self) -> u64 {
         self.frames_decoded
     }
 
     /// Number of times the loop has wrapped.
+    #[must_use]
     pub fn loop_count(&self) -> u32 {
         self.loop_count
     }
 
     /// Whether the stream is exhausted (and no loop applies).
+    #[must_use]
     pub fn is_finished(&self) -> bool {
         self.finished
     }
 
-    /// Reset to the first data chunk, clearing predictor state.
+    /// Reset to the first data chunk, clearing predictor state and cached loop snapshot.
     pub fn reset(&mut self) {
         self.next_chunk_offset = 0;
         self.started = false;
         self.finished = false;
         self.payload = &[];
         self.payload_pos = 0;
+        self.payload_big_endian = self.view.is_big_endian();
         self.in_payload_header = true;
         self.group_frames = 0;
         self.group_pos = 0;
         self.state = [AdpcmState::default(); MAX_CHANNELS];
         self.frames_decoded = 0;
         self.loop_count = 0;
+        self.loop_snapshot = None;
     }
 
     fn loop_bounds(&self) -> Option<(u64, u64)> {
@@ -101,11 +133,39 @@ impl<'a> EaDecoder<'a> {
         }
     }
 
+    fn capture_snapshot(&self) -> LoopSnapshot<'a> {
+        LoopSnapshot {
+            next_chunk_offset: self.next_chunk_offset,
+            payload: self.payload,
+            payload_pos: self.payload_pos,
+            payload_big_endian: self.payload_big_endian,
+            in_payload_header: self.in_payload_header,
+            group: self.group,
+            group_frames: self.group_frames,
+            group_pos: self.group_pos,
+            state: self.state,
+            frames_decoded: self.frames_decoded,
+        }
+    }
+
+    fn restore_snapshot(&mut self, snap: LoopSnapshot<'a>) {
+        self.next_chunk_offset = snap.next_chunk_offset;
+        self.started = true;
+        self.finished = false;
+        self.payload = snap.payload;
+        self.payload_pos = snap.payload_pos;
+        self.payload_big_endian = snap.payload_big_endian;
+        self.in_payload_header = snap.in_payload_header;
+        self.group = snap.group;
+        self.group_frames = snap.group_frames;
+        self.group_pos = snap.group_pos;
+        self.state = snap.state;
+        self.frames_decoded = snap.frames_decoded;
+    }
+
     /// Advance to the next data payload; returns `false` at end of stream.
     fn load_next_payload(&mut self) -> Result<bool> {
         loop {
-            // Find next chunk starting at next_chunk_offset via linear scan
-            // from that offset using the view's bytes.
             let bytes = self.view.bytes();
             if !self.started {
                 self.started = true;
@@ -114,22 +174,17 @@ impl<'a> EaDecoder<'a> {
             if self.next_chunk_offset >= bytes.len() {
                 return Ok(false);
             }
-            // Parse one chunk at next_chunk_offset.
-            let mut iter_offset = self.next_chunk_offset;
-            // Use a fresh ChunkIter positioned by scanning: cheaper to parse
-            // the single chunk manually here.
-            let chunk = parse_one(bytes, iter_offset)?;
-            let chunk = match chunk {
+            let chunk = match parse_one(bytes, self.next_chunk_offset)? {
                 Some(c) => c,
                 None => return Ok(false),
             };
-            iter_offset = chunk.offset + chunk.size;
-            self.next_chunk_offset = iter_offset;
+            self.next_chunk_offset = chunk.offset + chunk.size;
             match chunk.kind {
                 ChunkKind::Data => {
                     self.payload =
                         &bytes[chunk.payload_offset..chunk.payload_offset + chunk.payload_len];
                     self.payload_pos = 0;
+                    self.payload_big_endian = chunk.big_endian;
                     self.in_payload_header = true;
                     return Ok(true);
                 }
@@ -139,7 +194,51 @@ impl<'a> EaDecoder<'a> {
         }
     }
 
-    /// Refill the decoded group buffer. Returns false at EOF.
+    /// Parse the codec/generation-aware `SCDl`/`SCDb` subheader at the start of `self.payload`.
+    fn consume_payload_subheader(&mut self) {
+        let header = self.view.header();
+        let channels = header.channels as usize;
+        let codec = header.codec;
+        let be = self.payload_big_endian;
+        let has_ps1_word = header.ps1_stream_word.is_some();
+
+        let needed = header.scdl_subheader_len();
+        if self.payload.len() < needed {
+            self.payload_pos = self.payload.len();
+            self.in_payload_header = false;
+            return;
+        }
+
+        if matches!(
+            codec,
+            Codec::EaAdpcmR1 | Codec::EaAdpcmR2 | Codec::EaAdpcmR3
+        ) {
+            // Skip 4-byte sample count (plus optional 4-byte PS1 stream word),
+            // then load per-channel (prev1, prev2) i16 initial history.
+            let hist_start = if has_ps1_word { 8 } else { 4 };
+            for ch in 0..channels {
+                let off = hist_start + ch * 4;
+                let (prev1, prev2) = if be {
+                    (
+                        i16::from_be_bytes([self.payload[off], self.payload[off + 1]]),
+                        i16::from_be_bytes([self.payload[off + 2], self.payload[off + 3]]),
+                    )
+                } else {
+                    (
+                        i16::from_le_bytes([self.payload[off], self.payload[off + 1]]),
+                        i16::from_le_bytes([self.payload[off + 2], self.payload[off + 3]]),
+                    )
+                };
+                self.state[ch].prev1 = i32::from(prev1);
+                self.state[ch].prev2 = i32::from(prev2);
+            }
+        }
+
+        self.payload_pos = needed;
+        self.in_payload_header = false;
+    }
+
+    /// Refill the decoded group buffer. Returns `false` at EOF.
     fn refill_group(&mut self) -> Result<bool> {
         let channels = self.channels() as usize;
         let codec = self.codec();
@@ -151,10 +250,7 @@ impl<'a> EaDecoder<'a> {
                 continue;
             }
             if self.in_payload_header {
-                // Skip the 8-byte SCDl sub-header.
-                let skip = SCDL_HEADER_LEN.min(self.payload.len());
-                self.payload_pos = skip;
-                self.in_payload_header = false;
+                self.consume_payload_subheader();
                 if self.payload_pos >= self.payload.len() {
                     continue;
                 }
@@ -169,9 +265,10 @@ impl<'a> EaDecoder<'a> {
                         self.payload_pos = self.payload.len();
                         continue;
                     }
+                    let sample_bytes = frame_bytes / channels;
                     for f in 0..frames {
                         for ch in 0..channels {
-                            let off = f * frame_bytes + ch * (frame_bytes / channels);
+                            let off = f * frame_bytes + ch * sample_bytes;
                             let v = match codec {
                                 Codec::Pcm8 => i16::from(avail[off] as i8) << 8,
                                 Codec::Pcm16Le => i16::from_le_bytes([avail[off], avail[off + 1]]),
@@ -186,47 +283,77 @@ impl<'a> EaDecoder<'a> {
                     return Ok(true);
                 }
                 Codec::Ps1SpuAdpcm => {
-                    if avail.len() < 16 {
-                        self.payload_pos = self.payload.len();
-                        continue;
-                    }
                     if channels == 1 {
+                        if avail.len() < 16 {
+                            self.payload_pos = self.payload.len();
+                            continue;
+                        }
                         let n = decode_spu_block(
                             &mut self.state[0],
                             &avail[..16],
                             &mut self.group[..28],
                         )?;
                         self.group_frames = n;
+                        self.payload_pos += 16;
                     } else {
-                        // Stereo: blocks alternate L, R. A pair yields 28 frames.
+                        // Stereo: blocks alternate L, R. Decode directly with stride 2.
                         if avail.len() < 32 {
                             self.payload_pos = self.payload.len();
                             continue;
                         }
-                        let mut l = [0i16; 28];
-                        let mut r = [0i16; 28];
-                        decode_spu_block(&mut self.state[0], &avail[..16], &mut l)?;
-                        decode_spu_block(&mut self.state[1], &avail[16..32], &mut r)?;
-                        for i in 0..28 {
-                            self.group[i * 2] = l[i];
-                            self.group[i * 2 + 1] = r[i];
-                        }
+                        decode_spu_block_strided::<2>(
+                            &mut self.state[0],
+                            &avail[..16],
+                            &mut self.group[..56],
+                            0,
+                        )?;
+                        decode_spu_block_strided::<2>(
+                            &mut self.state[1],
+                            &avail[16..32],
+                            &mut self.group[..56],
+                            1,
+                        )?;
                         self.group_frames = 28;
-                        self.payload_pos += 16; // second block consumed below via extra advance
-                                                // Consume the right block as well.
-                        self.payload_pos += 16;
-                        self.group_pos = 0;
-                        return Ok(true);
+                        self.payload_pos += 32;
                     }
-                    self.payload_pos += 16;
                     self.group_pos = 0;
                     return Ok(true);
                 }
-                Codec::EaXaV1
-                | Codec::EaXaV2
-                | Codec::EaAdpcmR1
-                | Codec::EaAdpcmR2
-                | Codec::EaAdpcmR3 => {
+                Codec::EaXaV1 => {
+                    if channels == 1 {
+                        if avail.len() < 15 {
+                            self.payload_pos = self.payload.len();
+                            continue;
+                        }
+                        decode_ea_xa_subframe_strided::<1>(
+                            &mut self.state[0],
+                            &avail[..15],
+                            1,
+                            &mut self.group[..28],
+                            0,
+                            true,
+                        )?;
+                        self.payload_pos += 15;
+                    } else {
+                        // EA-XA v1 stereo: 30-byte block (2 header bytes + 28 L/R nibble-interleaved bytes).
+                        if avail.len() < 30 {
+                            self.payload_pos = self.payload.len();
+                            continue;
+                        }
+                        let (sl, sr) = self.state.split_at_mut(1);
+                        decode_ea_xa_v1_stereo_block(
+                            &mut sl[0],
+                            &mut sr[0],
+                            &avail[..30],
+                            &mut self.group[..56],
+                        )?;
+                        self.payload_pos += 30;
+                    }
+                    self.group_frames = 28;
+                    self.group_pos = 0;
+                    return Ok(true);
+                }
+                Codec::EaXaV2 | Codec::EaAdpcmR1 | Codec::EaAdpcmR2 | Codec::EaAdpcmR3 => {
                     let high_first = matches!(codec, Codec::EaAdpcmR2);
                     let subframe_len = if matches!(codec, Codec::EaAdpcmR3) {
                         16
@@ -244,43 +371,88 @@ impl<'a> EaDecoder<'a> {
                         1
                     };
                     if channels == 1 {
-                        decode_ea_xa_subframe_at(
+                        decode_ea_xa_subframe_strided::<1>(
                             &mut self.state[0],
                             &avail[..subframe_len],
                             data_offset,
                             &mut self.group[..28],
+                            0,
                             high_first,
                         )?;
-                        self.group_frames = 28;
                     } else {
-                        let mut l = [0i16; 28];
-                        let mut r = [0i16; 28];
-                        decode_ea_xa_subframe_at(
+                        decode_ea_xa_subframe_strided::<2>(
                             &mut self.state[0],
                             &avail[..subframe_len],
                             data_offset,
-                            &mut l,
+                            &mut self.group[..56],
+                            0,
                             high_first,
                         )?;
-                        decode_ea_xa_subframe_at(
+                        decode_ea_xa_subframe_strided::<2>(
                             &mut self.state[1],
                             &avail[subframe_len..subframe_len * 2],
                             data_offset,
-                            &mut r,
+                            &mut self.group[..56],
+                            1,
                             high_first,
                         )?;
-                        for i in 0..28 {
-                            self.group[i * 2] = l[i];
-                            self.group[i * 2 + 1] = r[i];
-                        }
-                        self.group_frames = 28;
                     }
+                    self.group_frames = 28;
                     self.payload_pos += needed;
                     self.group_pos = 0;
                     return Ok(true);
                 }
+                Codec::Mt10 => return Err(Error::UnsupportedCodec(0x04)),
+                Codec::EaXas => return Err(Error::UnsupportedCodec(0x16)),
                 Codec::Unknown(id) => return Err(Error::UnsupportedCodec(id)),
             }
+        }
+    }
+
+    /// Ensure `self.group` has frames ready to emit, handling loop-start snapshots and loop-end wraps.
+    /// Returns the number of frames to consume from `self.group[self.group_pos..]` (`0` at EOF).
+    fn prepare_frames(&mut self, max_take: usize) -> Result<usize> {
+        loop {
+            if let Some((s, e)) = self.loop_bounds() {
+                if self.frames_decoded >= e {
+                    self.seek_to_loop_start(s)?;
+                    self.loop_count = self.loop_count.saturating_add(1);
+                }
+            }
+            if self.group_pos >= self.group_frames {
+                if self.finished {
+                    return Ok(0);
+                }
+                if !self.refill_group()? {
+                    if let Some((s, _e)) = self.loop_bounds() {
+                        if self.frames_decoded > s {
+                            self.seek_to_loop_start(s)?;
+                            self.loop_count = self.loop_count.saturating_add(1);
+                            continue;
+                        }
+                    }
+                    self.finished = true;
+                    return Ok(0);
+                }
+            }
+            let avail_frames = self.group_frames - self.group_pos;
+            let mut take = avail_frames.min(max_take);
+            if let Some((s, e)) = self.loop_bounds() {
+                if self.loop_snapshot.is_none() {
+                    if self.frames_decoded == s {
+                        self.loop_snapshot = Some(self.capture_snapshot());
+                    } else if self.frames_decoded < s {
+                        let to_start = (s - self.frames_decoded) as usize;
+                        take = take.min(to_start);
+                    }
+                }
+                let remaining = e.saturating_sub(self.frames_decoded) as usize;
+                take = take.min(remaining);
+                if take == 0 {
+                    continue;
+                }
+            }
+            return Ok(take);
         }
     }
 
@@ -294,41 +466,9 @@ impl<'a> EaDecoder<'a> {
         let max_frames = out.len() / channels;
         let mut written = 0usize;
         while written < max_frames {
-            // Loop-end check before emitting more frames.
-            if let Some((_s, e)) = self.loop_bounds() {
-                if self.frames_decoded >= e {
-                    self.seek_to_frame(u64::from(self.view.header().loop_start.unwrap_or(0)))?;
-                    self.loop_count = self.loop_count.saturating_add(1);
-                }
-            }
-            if self.group_pos >= self.group_frames {
-                if self.finished {
-                    break;
-                }
-                match self.refill_group()? {
-                    true => {}
-                    false => {
-                        if let Some((s, _e)) = self.loop_bounds() {
-                            if self.frames_decoded > s {
-                                self.seek_to_frame(s)?;
-                                self.loop_count = self.loop_count.saturating_add(1);
-                                continue;
-                            }
-                        }
-                        self.finished = true;
-                        break;
-                    }
-                }
-            }
-            let avail_frames = self.group_frames - self.group_pos;
-            let mut take = avail_frames.min(max_frames - written);
-            // Respect loop_end boundary.
-            if let Some((_s, e)) = self.loop_bounds() {
-                let remaining = e.saturating_sub(self.frames_decoded) as usize;
-                take = take.min(remaining);
-                if take == 0 {
-                    continue;
-                }
+            let take = self.prepare_frames(max_frames - written)?;
+            if take == 0 {
+                break;
             }
             let src = self.group_pos * channels;
             let dst = written * channels;
@@ -341,44 +481,53 @@ impl<'a> EaDecoder<'a> {
         Ok(written)
     }
 
-    /// Decode into separate planar `f32` left/right buffers.
+    /// Decode into separate planar `f32` left/right buffers directly from the group buffer.
     /// For mono, the signal is written to `left` and `right` is filled
     /// with the same samples. Returns frames written.
     pub fn decode_f32_planar(&mut self, left: &mut [f32], right: &mut [f32]) -> Result<usize> {
         let n = left.len().min(right.len());
-        // Decode via a fixed stack buffer in chunks.
-        let mut buf = [0i16; 256 * MAX_CHANNELS];
+        let channels = self.channels() as usize;
+        if channels == 0 || n == 0 {
+            return Ok(0);
+        }
         let mut done = 0usize;
         while done < n {
-            let want = (n - done).min(256);
-            let got = self.decode_i16(&mut buf[..want * self.channels() as usize])?;
-            if got == 0 {
+            let take = self.prepare_frames(n - done)?;
+            if take == 0 {
                 break;
             }
-            let ch = self.channels() as usize;
-            for i in 0..got {
-                let l = buf[i * ch];
-                let r = if ch == 2 { buf[i * ch + 1] } else { l };
-                left[done + i] = f32::from(l) / 32768.0;
-                right[done + i] = f32::from(r) / 32768.0;
+            if channels == 1 {
+                let src = &self.group[self.group_pos..self.group_pos + take];
+                for (i, &s) in src.iter().enumerate() {
+                    let v = f32::from(s) * INV_32768;
+                    left[done + i] = v;
+                    right[done + i] = v;
+                }
+            } else {
+                let src = &self.group[self.group_pos * 2..(self.group_pos + take) * 2];
+                for i in 0..take {
+                    left[done + i] = f32::from(src[i * 2]) * INV_32768;
+                    right[done + i] = f32::from(src[i * 2 + 1]) * INV_32768;
+                }
             }
-            done += got;
-            if got < want {
-                break;
-            }
+            self.group_pos += take;
+            done += take;
+            self.frames_decoded += take as u64;
         }
         Ok(done)
     }
 
-    /// Seek by resetting and discarding decoded frames up to `target`.
-    fn seek_to_frame(&mut self, target: u64) -> Result<()> {
+    /// Jump back to `loop_start` in O(1) using the cached snapshot, falling back to a linear
+    /// scan only if the snapshot was not yet captured.
+    fn seek_to_loop_start(&mut self, target: u64) -> Result<()> {
+        if let Some(snap) = self.loop_snapshot {
+            self.restore_snapshot(snap);
+            return Ok(());
+        }
         let saved_loop = self.loop_count;
         self.reset();
         self.loop_count = saved_loop;
-        let discard = [0i16; 512 * MAX_CHANNELS];
         let mut remaining = target;
-        // Temporarily clear loop bounds effect by decoding with raw refill:
-        // decode_i16 would re-trigger looping, so discard via group refill.
         while remaining > 0 {
             if self.group_pos >= self.group_frames && !self.refill_group()? {
                 break;
@@ -388,8 +537,8 @@ impl<'a> EaDecoder<'a> {
             self.group_pos += take;
             self.frames_decoded += take as u64;
             remaining -= take as u64;
-            let _ = &discard;
         }
+        self.loop_snapshot = Some(self.capture_snapshot());
         Ok(())
     }
 }

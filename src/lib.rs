@@ -1,13 +1,11 @@
-//! Standalone pure-Rust EA `SCHl` / ASF / EA-XA / EACS audio codec and
+//! Standalone pure-Rust EA `SCHl` / ASF / EA-XA audio codec and
 //! stream decoder with zero runtime dependencies.
 //!
-//! Chunk framing, PT TLV headers, EA-XA (v1/v2), PS1 SPU-ADPCM payloads
-//! inside PS1 `SCHl`, PCM8/PCM16 (LE & BE) and EA-ADPCM R1/R2/R3 are
-//! supported. Hot decode loops perform no heap allocation; the
-//! [`EaStreamView`] / [`EaDecoder`] streaming API is zero-allocation.
-//!
-//! EA ASF files use the same `SCHl` chunk framing as EACS streams, so
-//! [`EaStreamView::parse`] handles both.
+//! Chunk framing (`SCHl`/`SCCl`/`SCDl`/`SCLl`/`SCEl` and big-endian `SCHb`/`SCDb`/`SCEb`),
+//! PT TLV headers (`PT\x01\x00`, `PT\x00\x00`, and `GSTR`), EA-XA (v1/v2), PS1 SPU-ADPCM
+//! payloads inside PS1 `SCHl`, PCM8/PCM16 (LE & BE), and EA-ADPCM R1/R2/R3 are supported.
+//! Hot decode loops perform no heap allocation; the [`EaStreamView`] / [`EaDecoder`]
+//! streaming API is zero-allocation.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
@@ -20,8 +18,8 @@ pub mod codec;
 pub mod decoder;
 
 pub use codec::{
-    decode_ea_xa_subframe, decode_ea_xa_subframe_at, decode_spu_block, ea_xa_step, spu_step,
-    AdpcmState, Codec, EA_XA_PREDICTORS, SPU_PREDICTORS,
+    decode_ea_xa_subframe, decode_ea_xa_subframe_at, decode_ea_xa_v1_stereo_block,
+    decode_spu_block, ea_xa_step, spu_step, AdpcmState, Codec, EA_XA_PREDICTORS, SPU_PREDICTORS,
 };
 pub use decoder::EaDecoder;
 
@@ -31,7 +29,7 @@ use core::fmt;
 pub type Result<T> = core::result::Result<T, Error>;
 
 /// Error returned by parsing and decoding.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Error {
     /// Input ended before a required field completed.
@@ -59,7 +57,7 @@ pub enum Error {
         /// Declared chunk size.
         size: u32,
     },
-    /// The leading `SCHl`/`SCHb` chunk contained no `PT\x01\x00` header.
+    /// The leading `SCHl`/`SCHb` chunk contained no `PT\x01\x00`, `PT\x00\x00`, or `GSTR` header.
     MissingPtHeader {
         /// Byte offset of the header chunk.
         offset: usize,
@@ -164,27 +162,29 @@ pub const MAGIC_SCHB: [u8; 4] = *b"SCHb";
 pub const MAGIC_SCDB: [u8; 4] = *b"SCDb";
 /// `SCEb` end tag (big-endian family).
 pub const MAGIC_SCEB: [u8; 4] = *b"SCEb";
-/// PT header signature.
+/// PT v1 header signature (`PT\x01\x00`).
 pub const PT_MAGIC: [u8; 4] = *b"PT\x01\x00";
+/// PT v0 header signature (`PT\x00\x00`).
+pub const PT_MAGIC_V0: [u8; 4] = *b"PT\x00\x00";
+/// `GSTR` platform header signature (followed by 4-byte platform/padding word before PT TLVs).
+pub const GSTR_MAGIC: [u8; 4] = *b"GSTR";
 /// Default sample rate when PT tag `0x84` is absent.
 pub const DEFAULT_SAMPLE_RATE: u32 = 22_050;
 /// Default channel count when PT tag `0x82` is absent.
 pub const DEFAULT_CHANNELS: u32 = 1;
 
 const CHUNK_HEADER_LEN: usize = 8;
-/// Bytes of sub-header at the start of every `SCDl` payload in SCHl streams.
-pub const SCDL_HEADER_LEN: usize = 8;
 
 /// Classification of a chunk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ChunkKind {
     /// `SCHl` / `SCHb` header.
     Header,
-    /// `SCCl` count metadata.
+    /// `SCCl` / `SCCb` count metadata.
     Count,
     /// `SCDl` / `SCDb` audio data.
     Data,
-    /// `SCLl` loop marker.
+    /// `SCLl` / `SCLb` loop marker.
     Loop,
     /// `SCEl` / `SCEb` end marker.
     End,
@@ -203,6 +203,7 @@ impl ChunkKind {
             _ => Self::Other(tag),
         }
     }
+
     fn is_big_endian(tag: [u8; 4]) -> bool {
         tag[3] == b'b'
     }
@@ -232,13 +233,17 @@ pub struct Chunk {
 pub struct Header {
     /// Optional PS1 stream word at `+0x08` (PT at `+0x0c`).
     pub ps1_stream_word: Option<u32>,
-    /// Absolute offset of the PT magic.
+    /// Absolute offset of the PT / `GSTR` magic.
     pub pt_offset: usize,
+    /// Version or platform identifier from tag `0x80`, if present.
+    pub version: Option<u32>,
+    /// Sample width from tag `0x81`, if present (typically `1`/`8` for 8-bit or `2`/`16` for 16-bit).
+    pub bits_per_sample: Option<u32>,
     /// Channel count (1 or 2).
     pub channels: u32,
     /// Raw codec id from tag `0x83`, if present.
     pub codec_id: Option<u32>,
-    /// Resolved codec (inferred when `codec_id` is absent).
+    /// Resolved codec (inferred from PT context when needed).
     pub codec: Codec,
     /// Sample rate in Hz.
     pub sample_rate: u32,
@@ -250,6 +255,35 @@ pub struct Header {
     pub loop_end: Option<u32>,
     /// Stream flags from tag `0x8a`, if present.
     pub flags: Option<u32>,
+}
+
+impl Header {
+    /// Expected byte length of the per-chunk subheader at the start of each `SCDl`/`SCDb` payload.
+    ///
+    /// - Non-PS1 PCM / EA-XA v1 / EA-XA v2: `4` bytes (sample count).
+    /// - PS1 `SCHl` / PS1 SPU-ADPCM: `8` bytes (4-byte PS1 stream word + 4-byte sample count).
+    /// - EA-ADPCM R1/R2/R3: `4 + 4 * channels` bytes (`8` mono, `12` stereo; `+4` if a PS1 stream
+    ///   word is present), carrying per-channel `(prev1, prev2)` `i16` initial history.
+    #[must_use]
+    pub fn scdl_subheader_len(&self) -> usize {
+        let base = if self.ps1_stream_word.is_some() || self.codec == Codec::Ps1SpuAdpcm {
+            8
+        } else {
+            4
+        };
+        if matches!(
+            self.codec,
+            Codec::EaAdpcmR1 | Codec::EaAdpcmR2 | Codec::EaAdpcmR3
+        ) {
+            base + (self.channels as usize) * 4
+        } else {
+            base
+        }
+    }
+}
+
+fn is_pt_magic(slice: Option<&[u8]>) -> bool {
+    slice == Some(&PT_MAGIC[..]) || slice == Some(&PT_MAGIC_V0[..])
 }
 
 fn read_chunk_size(bytes: &[u8], offset: usize, be: bool) -> Result<usize> {
@@ -272,29 +306,51 @@ fn read_chunk_size(bytes: &[u8], offset: usize, be: bool) -> Result<usize> {
     Ok(v as usize)
 }
 
-fn parse_pt(chunk: &[u8], chunk_offset: usize) -> Result<Header> {
+fn read_be_u32(val: &[u8], tag_offset: usize, tag: u8) -> Result<u32> {
+    if val.len() > 4 {
+        return Err(Error::MalformedPtTlv {
+            offset: tag_offset,
+            tag,
+            reason: "integer value exceeds 4 bytes",
+        });
+    }
+    let mut v: u32 = 0;
+    for &b in val {
+        v = (v << 8) | u32::from(b);
+    }
+    Ok(v)
+}
+
+fn parse_pt(chunk: &[u8], chunk_offset: usize, big_endian: bool) -> Result<Header> {
     let payload = chunk.get(CHUNK_HEADER_LEN..).ok_or(Error::Truncated {
         offset: chunk_offset,
         needed: CHUNK_HEADER_LEN,
         available: chunk.len(),
     })?;
-    let (ps1_stream_word, pt_rel) = if payload.get(0..4) == Some(&PT_MAGIC[..]) {
-        (None, CHUNK_HEADER_LEN)
-    } else if payload.len() >= 8 && payload.get(4..8) == Some(&PT_MAGIC[..]) {
+    let (ps1_stream_word, pt_rel, tlv_start) = if is_pt_magic(payload.get(0..4)) {
+        (None, CHUNK_HEADER_LEN, CHUNK_HEADER_LEN + 4)
+    } else if payload.len() >= 8 && payload.get(0..4) == Some(&GSTR_MAGIC[..]) {
+        // GSTR + 4-byte platform/padding word, followed by PT TLV stream.
+        (None, CHUNK_HEADER_LEN, CHUNK_HEADER_LEN + 8)
+    } else if payload.len() >= 8 && is_pt_magic(payload.get(4..8)) {
         (
             Some(u32::from_le_bytes([
                 payload[0], payload[1], payload[2], payload[3],
             ])),
             CHUNK_HEADER_LEN + 4,
+            CHUNK_HEADER_LEN + 8,
         )
     } else {
         return Err(Error::MissingPtHeader {
             offset: chunk_offset,
         });
     };
+
     let mut h = Header {
         ps1_stream_word,
         pt_offset: chunk_offset + pt_rel,
+        version: None,
+        bits_per_sample: None,
         channels: DEFAULT_CHANNELS,
         codec_id: None,
         codec: Codec::EaXaV2,
@@ -304,7 +360,8 @@ fn parse_pt(chunk: &[u8], chunk_offset: usize) -> Result<Header> {
         loop_end: None,
         flags: None,
     };
-    let mut cursor = pt_rel + 4;
+
+    let mut cursor = tlv_start;
     while cursor < chunk.len() {
         let tag_offset = chunk_offset + cursor;
         let tag = chunk[cursor];
@@ -320,33 +377,43 @@ fn parse_pt(chunk: &[u8], chunk_offset: usize) -> Result<Header> {
                     available: 0,
                 })?;
                 cursor += 1;
-                let val_len = usize::from(len_byte);
-                if val_len > 4 {
-                    return Err(Error::MalformedPtTlv {
+                let val_len = if len_byte == 0xFF {
+                    let ext = chunk.get(cursor..cursor + 4).ok_or(Error::Truncated {
+                        offset: chunk_offset + cursor,
+                        needed: 4,
+                        available: chunk.len().saturating_sub(cursor),
+                    })?;
+                    cursor += 4;
+                    let raw = u32::from_be_bytes([ext[0], ext[1], ext[2], ext[3]]);
+                    usize::try_from(raw).map_err(|_| Error::MalformedPtTlv {
                         offset: tag_offset,
                         tag,
-                        reason: "integer value exceeds 4 bytes",
-                    });
-                }
-                let end = cursor + val_len;
+                        reason: "extended TLV length overflows usize",
+                    })?
+                } else {
+                    usize::from(len_byte)
+                };
+                let end = cursor.checked_add(val_len).ok_or(Error::MalformedPtTlv {
+                    offset: tag_offset,
+                    tag,
+                    reason: "TLV value length overflows",
+                })?;
                 let val = chunk.get(cursor..end).ok_or(Error::Truncated {
                     offset: chunk_offset + cursor,
                     needed: val_len,
                     available: chunk.len().saturating_sub(cursor),
                 })?;
                 cursor = end;
-                let mut v: u32 = 0;
-                for &b in val {
-                    v = (v << 8) | u32::from(b);
-                }
                 match tag {
-                    0x82 => h.channels = v,
-                    0x83 => h.codec_id = Some(v),
-                    0x84 => h.sample_rate = v,
-                    0x85 => h.num_samples = Some(v),
-                    0x86 => h.loop_start = Some(v),
-                    0x87 => h.loop_end = Some(v),
-                    0x8A => h.flags = Some(v),
+                    0x80 => h.version = Some(read_be_u32(val, tag_offset, tag)?),
+                    0x81 => h.bits_per_sample = Some(read_be_u32(val, tag_offset, tag)?),
+                    0x82 => h.channels = read_be_u32(val, tag_offset, tag)?,
+                    0x83 => h.codec_id = Some(read_be_u32(val, tag_offset, tag)?),
+                    0x84 => h.sample_rate = read_be_u32(val, tag_offset, tag)?,
+                    0x85 => h.num_samples = Some(read_be_u32(val, tag_offset, tag)?),
+                    0x86 => h.loop_start = Some(read_be_u32(val, tag_offset, tag)?),
+                    0x87 => h.loop_end = Some(read_be_u32(val, tag_offset, tag)?),
+                    0x8A => h.flags = Some(read_be_u32(val, tag_offset, tag)?),
                     _ => {}
                 }
             }
@@ -355,17 +422,16 @@ fn parse_pt(chunk: &[u8], chunk_offset: usize) -> Result<Header> {
     if h.channels == 0 || h.channels > 2 {
         return Err(Error::InvalidChannels(h.channels));
     }
-    h.codec = match h.codec_id {
-        Some(id) => {
-            let c = Codec::from_pt_id(id);
-            if let Codec::Unknown(x) = c {
-                return Err(Error::UnsupportedCodec(x));
-            }
-            c
-        }
-        None if h.ps1_stream_word.is_some() => Codec::Ps1SpuAdpcm,
-        None => Codec::EaXaV2,
-    };
+    h.codec = Codec::from_pt_context(
+        h.codec_id,
+        h.version,
+        h.bits_per_sample,
+        h.ps1_stream_word,
+        big_endian,
+    );
+    if let Codec::Unknown(x) = h.codec {
+        return Err(Error::UnsupportedCodec(x));
+    }
     Ok(h)
 }
 
@@ -405,7 +471,7 @@ impl<'a> EaStreamView<'a> {
                 available: bytes.len(),
             });
         }
-        let header = parse_pt(&bytes[..size], 0)?;
+        let header = parse_pt(&bytes[..size], 0, be)?;
         Ok(Self {
             bytes,
             header,
@@ -414,32 +480,38 @@ impl<'a> EaStreamView<'a> {
         })
     }
 
-    /// Return `true` if `bytes` look like an `SCHl` stream.
+    /// Return `true` if `bytes` look like an `SCHl`/`SCHb` stream.
+    #[must_use]
     pub fn identifies(bytes: &[u8]) -> bool {
         EaStreamView::parse(bytes).is_ok()
     }
 
     /// Parsed PT header.
+    #[must_use]
     pub fn header(&self) -> &Header {
         &self.header
     }
 
     /// Full source bytes.
+    #[must_use]
     pub fn bytes(&self) -> &'a [u8] {
         self.bytes
     }
 
     /// Whether the stream uses the big-endian chunk family.
+    #[must_use]
     pub fn is_big_endian(&self) -> bool {
         self.big_endian
     }
 
     /// Size of the leading header chunk.
+    #[must_use]
     pub fn first_chunk_size(&self) -> usize {
         self.first_chunk_size
     }
 
     /// Iterate chunks lazily; iteration stops after the end chunk or on error.
+    #[must_use]
     pub fn chunks(&self) -> ChunkIter<'a> {
         ChunkIter {
             bytes: self.bytes,
@@ -448,7 +520,7 @@ impl<'a> EaStreamView<'a> {
         }
     }
 
-    /// Payload slices of all `SCDl`/`SCDb` chunks (including 8-byte sub-header).
+    /// Payload slices of all `SCDl`/`SCDb` chunks (including their per-chunk subheaders).
     pub fn data_payloads(&self) -> impl Iterator<Item = Result<&'a [u8]>> + 'a {
         let bytes = self.bytes;
         self.chunks().filter_map(move |c| match c {
@@ -471,6 +543,7 @@ pub struct ChunkIter<'a> {
 
 impl<'a> Iterator for ChunkIter<'a> {
     type Item = Result<Chunk>;
+
     fn next(&mut self) -> Option<Self::Item> {
         if self.done || self.offset >= self.bytes.len() {
             return None;
@@ -545,11 +618,26 @@ pub fn decode_all_i16(view: EaStreamView<'_>) -> Result<alloc::vec::Vec<i16>> {
     Ok(out)
 }
 
+// Compile-time Send + Sync verification for all public types.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Error>();
+    assert_send_sync::<Codec>();
+    assert_send_sync::<ChunkKind>();
+    assert_send_sync::<Chunk>();
+    assert_send_sync::<Header>();
+    assert_send_sync::<AdpcmState>();
+    assert_send_sync::<EaStreamView<'static>>();
+    assert_send_sync::<ChunkIter<'static>>();
+    assert_send_sync::<EaDecoder<'static>>();
+};
+
 #[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
+
     #[test]
     fn error_display_works() {
-        assert!(format!("{}", Error::UnsupportedCodec(99)).contains("99"));
+        assert!(alloc::format!("{}", Error::UnsupportedCodec(99)).contains("99"));
     }
 }

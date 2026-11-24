@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.70"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
-description = "Standalone pure-Rust EA SCHl/ASF/EA-XA/EACS audio codec and stream decoder"
+description = "Standalone pure-Rust EA SCHl/ASF/EA-XA audio codec and stream decoder"
 keywords = ["ea", "schl", "adpcm", "audio", "ps1"]
 categories = ["multimedia::audio", "emulators", "no-std"]
 
