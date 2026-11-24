@@ -5,6 +5,7 @@ edition = "2021"
 rust-version = "1.70"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/JidouGhost-TL/libea-audio-rs"
 description = "Standalone pure-Rust EA SCHl/ASF/EA-XA audio codec and stream decoder"
 keywords = ["ea", "schl", "adpcm", "audio", "ps1"]
 categories = ["multimedia::audio", "emulators", "no-std"]
